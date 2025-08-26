@@ -1,7 +1,9 @@
 import { ReactNode } from "react";
+import { Link, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Monitor, Users, Settings, BarChart3, LogOut, Menu } from "lucide-react";
+import { Monitor, Users, Settings, BarChart3, LogOut, Menu, Image } from "lucide-react";
+import { useAuth } from "@/contexts/AuthContext";
 import { cn } from "@/lib/utils";
 
 interface DashboardLayoutProps {
@@ -12,12 +14,19 @@ interface DashboardLayoutProps {
 const navigation = [
   { name: "Dashboard", href: "/", icon: Monitor },
   { name: "Devices", href: "/devices", icon: Monitor },
-  { name: "Content", href: "/content", icon: BarChart3 },
-  { name: "Playlists", href: "/playlists", icon: Users },
+  { name: "Content", href: "/content", icon: Image },
+  { name: "Playlists", href: "/playlists", icon: BarChart3 },
   { name: "Settings", href: "/settings", icon: Settings },
 ];
 
 export function DashboardLayout({ children, currentPage = "Dashboard" }: DashboardLayoutProps) {
+  const { signOut } = useAuth();
+  const navigate = useNavigate();
+
+  const handleSignOut = async () => {
+    await signOut();
+    navigate('/');
+  };
   return (
     <div className="min-h-screen bg-background text-foreground">
       {/* Header */}
@@ -40,7 +49,7 @@ export function DashboardLayout({ children, currentPage = "Dashboard" }: Dashboa
               <div className="w-2 h-2 bg-success rounded-full animate-pulse-soft"></div>
               <span className="text-sm text-muted-foreground">Connected</span>
             </div>
-            <Button variant="ghost" size="sm">
+            <Button variant="ghost" size="sm" onClick={handleSignOut}>
               <LogOut className="h-4 w-4 mr-2" />
               Logout
             </Button>
@@ -60,9 +69,12 @@ export function DashboardLayout({ children, currentPage = "Dashboard" }: Dashboa
                   "w-full justify-start",
                   currentPage === item.name && "bg-primary text-primary-foreground shadow-glow"
                 )}
+                asChild
               >
-                <item.icon className="h-4 w-4 mr-3" />
-                {item.name}
+                <Link to={item.href}>
+                  <item.icon className="h-4 w-4 mr-3" />
+                  {item.name}
+                </Link>
               </Button>
             ))}
           </nav>
