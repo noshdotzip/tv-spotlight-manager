@@ -1,0 +1,543 @@
+# TinyBillboard Digital Signage Dashboard - Complete Setup Guide
+
+## Overview
+This is a comprehensive digital signage management dashboard for Roku/Fire TV devices. The system allows users to manage content, create playlists, and remotely control their billboard displays.
+
+## Architecture
+Frontend: React + TypeScript + Tailwind CSS + shadcn/ui
+Backend: Supabase (PostgreSQL + Authentication + Edge Functions + Storage)
+File Storage: Supabase Storage for images/videos
+Streaming: Devices fetch content via GET endpoints
+
+## Required Backend Setup (Supabase Integration)
+
+### 1. Connect to Supabase
+- Click the green "Supabase" button in Lovable interface
+- Create new project or connect existing one
+- Enable Authentication with email/password
+
+### 2. Database Schema (Run these SQL commands in Supabase SQL Editor)
+
+```sql
+-- Enable Row Level Security
+ALTER TABLE auth.users ENABLE ROW LEVEL SECURITY;
+
+-- Users profile table
+CREATE TABLE public.profiles (
+  id UUID REFERENCES auth.users(id) PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  full_name TEXT,
+  company_name TEXT,
+  subscription_tier TEXT DEFAULT 'free',
+  subscription_status TEXT DEFAULT 'active',
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Enable RLS for profiles
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policy for profiles (users can only see their own)
+CREATE POLICY "Users can view their own profile" ON public.profiles
+  FOR ALL USING (auth.uid() = id);
+
+-- Devices table
+CREATE TABLE public.devices (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  link_code TEXT UNIQUE NOT NULL,
+  device_type TEXT DEFAULT 'roku', -- roku, firetv, android
+  status TEXT DEFAULT 'offline', -- online, offline, syncing
+  last_seen TIMESTAMPTZ DEFAULT NOW(),
+  location TEXT,
+  ip_address INET,
+  device_info JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Enable RLS for devices
+ALTER TABLE public.devices ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policy for devices
+CREATE POLICY "Users can manage their own devices" ON public.devices
+  FOR ALL USING (auth.uid() = user_id);
+
+-- Content table
+CREATE TABLE public.content (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+  filename TEXT NOT NULL,
+  original_name TEXT NOT NULL,
+  file_type TEXT NOT NULL, -- image/jpeg, image/png, video/mp4, etc
+  file_size BIGINT NOT NULL,
+  aspect_ratio TEXT DEFAULT '9:16', -- 16:9, 9:16, 1:1
+  duration INTEGER, -- for videos, in seconds
+  storage_path TEXT NOT NULL,
+  thumbnail_path TEXT,
+  metadata JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Enable RLS for content
+ALTER TABLE public.content ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policy for content
+CREATE POLICY "Users can manage their own content" ON public.content
+  FOR ALL USING (auth.uid() = user_id);
+
+-- Playlists table
+CREATE TABLE public.playlists (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  day_of_week INTEGER, -- 0=Sunday, 1=Monday, etc. NULL for event playlists
+  is_event_playlist BOOLEAN DEFAULT FALSE,
+  is_active BOOLEAN DEFAULT FALSE, -- for event playlists
+  image_duration INTEGER DEFAULT 5, -- seconds per image
+  description TEXT,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Enable RLS for playlists
+ALTER TABLE public.playlists ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policy for playlists
+CREATE POLICY "Users can manage their own playlists" ON public.playlists
+  FOR ALL USING (auth.uid() = user_id);
+
+-- Playlist items (content in playlists)
+CREATE TABLE public.playlist_items (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  playlist_id UUID REFERENCES public.playlists(id) ON DELETE CASCADE,
+  content_id UUID REFERENCES public.content(id) ON DELETE CASCADE,
+  order_index INTEGER NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Enable RLS for playlist_items
+ALTER TABLE public.playlist_items ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policy for playlist_items
+CREATE POLICY "Users can manage their playlist items" ON public.playlist_items
+  FOR ALL USING (
+    EXISTS (
+      SELECT 1 FROM public.playlists p
+      WHERE p.id = playlist_id AND p.user_id = auth.uid()
+    )
+  );
+
+-- Device logs for diagnostics
+CREATE TABLE public.device_logs (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  device_id UUID REFERENCES public.devices(id) ON DELETE CASCADE,
+  log_type TEXT NOT NULL, -- 'heartbeat', 'error', 'content_change', etc
+  message TEXT,
+  metadata JSONB,
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Enable RLS for device_logs
+ALTER TABLE public.device_logs ENABLE ROW LEVEL SECURITY;
+
+-- RLS Policy for device_logs (users see their device logs, admins see all)
+CREATE POLICY "Users can view their device logs" ON public.device_logs
+  FOR SELECT USING (
+    EXISTS (
+      SELECT 1 FROM public.devices d
+      WHERE d.id = device_id AND d.user_id = auth.uid()
+    ) OR 
+    EXISTS (
+      SELECT 1 FROM public.profiles p
+      WHERE p.id = auth.uid() AND p.email = 'nosh@admin.com'
+    )
+  );
+
+-- Admin user creation function
+CREATE OR REPLACE FUNCTION create_admin_user()
+RETURNS void AS $$
+BEGIN
+  -- This will be created via Supabase Auth, then profile added
+  INSERT INTO public.profiles (id, email, full_name, subscription_tier)
+  VALUES (
+    (SELECT id FROM auth.users WHERE email = 'nosh@admin.com'),
+    'nosh@admin.com',
+    'Administrator',
+    'admin'
+  ) ON CONFLICT (id) DO NOTHING;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Functions for device status updates
+CREATE OR REPLACE FUNCTION update_device_status(device_link_code TEXT, new_status TEXT)
+RETURNS void AS $$
+BEGIN
+  UPDATE public.devices 
+  SET 
+    status = new_status,
+    last_seen = NOW(),
+    updated_at = NOW()
+  WHERE link_code = device_link_code;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Generate unique link codes
+CREATE OR REPLACE FUNCTION generate_link_code()
+RETURNS TEXT AS $$
+DECLARE
+  chars TEXT := 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  result TEXT := '';
+  i INTEGER;
+BEGIN
+  FOR i IN 1..6 LOOP
+    result := result || substr(chars, floor(random() * length(chars) + 1)::int, 1);
+  END LOOP;
+  RETURN result;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+### 3. Storage Setup (In Supabase Storage)
+
+Create the following buckets:
+- `content` - for user uploaded images/videos
+- `thumbnails` - for auto-generated thumbnails
+
+Set bucket policies:
+```sql
+-- Content bucket policy
+CREATE POLICY "Users can upload their content" ON storage.objects
+  FOR INSERT WITH CHECK (
+    bucket_id = 'content' AND 
+    auth.uid()::text = (storage.foldername(name))[1]
+  );
+
+CREATE POLICY "Users can view their content" ON storage.objects
+  FOR SELECT USING (
+    bucket_id = 'content' AND
+    auth.uid()::text = (storage.foldername(name))[1]
+  );
+
+-- Similar policies for thumbnails bucket
+CREATE POLICY "Users can upload thumbnails" ON storage.objects
+  FOR INSERT WITH CHECK (
+    bucket_id = 'thumbnails' AND 
+    auth.uid()::text = (storage.foldername(name))[1]
+  );
+
+CREATE POLICY "Anyone can view thumbnails" ON storage.objects
+  FOR SELECT USING (bucket_id = 'thumbnails');
+```
+
+### 4. Edge Functions (Create in Supabase Edge Functions)
+
+#### A. Device Content API (`get-device-content`)
+```typescript
+import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  const url = new URL(req.url);
+  const linkCode = url.searchParams.get("link_code");
+  
+  if (!linkCode) {
+    return new Response(
+      JSON.stringify({ error: "Missing link_code parameter" }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 400 }
+    );
+  }
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  );
+
+  try {
+    // Update device last_seen
+    await supabase.rpc('update_device_status', {
+      device_link_code: linkCode,
+      new_status: 'online'
+    });
+
+    // Get device info
+    const { data: device } = await supabase
+      .from('devices')
+      .select('user_id')
+      .eq('link_code', linkCode)
+      .single();
+
+    if (!device) {
+      return new Response(
+        JSON.stringify({ error: "Device not found" }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 404 }
+      );
+    }
+
+    // Get current day's playlist or active event playlist
+    const today = new Date().getDay();
+    
+    const { data: playlists } = await supabase
+      .from('playlists')
+      .select(`
+        *,
+        playlist_items (
+          order_index,
+          content (*)
+        )
+      `)
+      .eq('user_id', device.user_id)
+      .or(`day_of_week.eq.${today},and(is_event_playlist.eq.true,is_active.eq.true)`)
+      .order('is_event_playlist', { ascending: false }); // Event playlists take priority
+
+    const activePlaylist = playlists?.[0];
+    
+    if (!activePlaylist) {
+      return new Response(
+        JSON.stringify({ 
+          playlist: null,
+          content: [],
+          image_duration: 5
+        }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Format content with full URLs
+    const content = activePlaylist.playlist_items
+      .sort((a, b) => a.order_index - b.order_index)
+      .map(item => ({
+        id: item.content.id,
+        filename: item.content.filename,
+        file_type: item.content.file_type,
+        duration: item.content.duration,
+        url: `${Deno.env.get("SUPABASE_URL")}/storage/v1/object/public/content/${device.user_id}/${item.content.storage_path}`
+      }));
+
+    return new Response(
+      JSON.stringify({
+        playlist: {
+          id: activePlaylist.id,
+          name: activePlaylist.name,
+          image_duration: activePlaylist.image_duration
+        },
+        content
+      }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+
+  } catch (error) {
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
+    );
+  }
+});
+```
+
+#### B. Link Device Function (`link-device`)
+```typescript
+import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.0";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+};
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  const { linkCode, deviceName } = await req.json();
+  
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader) {
+    return new Response(
+      JSON.stringify({ error: "Unauthorized" }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 401 }
+    );
+  }
+
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_ANON_KEY")!,
+    { global: { headers: { Authorization: authHeader } } }
+  );
+
+  try {
+    const { data: { user } } = await supabase.auth.getUser();
+    
+    if (!user) {
+      return new Response(
+        JSON.stringify({ error: "Unauthorized" }),
+        { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 401 }
+      );
+    }
+
+    // Check if device with this link code exists and is unlinked
+    const { data: existingDevice } = await supabase
+      .from('devices')
+      .select('*')
+      .eq('link_code', linkCode)
+      .is('user_id', null)
+      .single();
+
+    if (existingDevice) {
+      // Link existing device
+      const { error } = await supabase
+        .from('devices')
+        .update({
+          user_id: user.id,
+          name: deviceName || 'My Device',
+          status: 'online',
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', existingDevice.id);
+
+      if (error) throw error;
+    } else {
+      // Create new device
+      const { error } = await supabase
+        .from('devices')
+        .insert({
+          user_id: user.id,
+          name: deviceName || 'My Device',
+          link_code: linkCode,
+          status: 'online'
+        });
+
+      if (error) throw error;
+    }
+
+    return new Response(
+      JSON.stringify({ success: true }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+
+  } catch (error) {
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { headers: { ...corsHeaders, "Content-Type": "application/json" }, status: 500 }
+    );
+  }
+});
+```
+
+### 5. Authentication Setup
+
+Create the admin user in Supabase Auth:
+1. Go to Authentication > Users in Supabase dashboard
+2. Create user with email: `nosh@admin.com` and password: `0129`
+3. Run the `create_admin_user()` function to set up the profile
+
+### 6. Frontend Integration
+
+Update the React components to use real Supabase data:
+
+1. **Authentication Context** - Create `src/contexts/AuthContext.tsx`
+2. **Supabase Client** - Create `src/lib/supabase.ts`
+3. **API Hooks** - Create custom hooks for devices, playlists, content
+4. **File Upload** - Implement drag & drop file upload to Supabase Storage
+5. **Real-time Updates** - Use Supabase real-time subscriptions for device status
+
+### 7. Subscription Integration (Optional)
+
+For subscription-based billing, you can integrate Stripe:
+1. Add Stripe webhook handlers
+2. Create subscription tiers in your pricing page
+3. Limit features based on subscription level
+
+### 8. Device App Development
+
+For the Roku/Fire TV apps:
+1. **Roku**: Use BrightScript to create a simple app that:
+   - Generates random 6-digit codes
+   - Displays the code on screen
+   - Polls the `get-device-content` endpoint
+   - Displays slideshow content
+
+2. **Fire TV**: Use Android/Kotlin to create similar functionality
+
+### 9. Deployment
+
+1. Build the React app: `npm run build`
+2. Deploy to Vercel, Netlify, or similar
+3. Set up your custom domain
+4. Configure Supabase edge functions
+5. Set up monitoring and analytics
+
+### 10. Development Commands
+
+```bash
+# Install dependencies
+npm install
+
+# Run development server
+npm run dev
+
+# Build for production
+npm run build
+
+# Preview production build
+npm run preview
+
+# Deploy to Supabase (edge functions)
+supabase functions deploy get-device-content
+supabase functions deploy link-device
+```
+
+### 11. Environment Variables
+
+Create `.env.local`:
+```
+VITE_SUPABASE_URL=your_supabase_url
+VITE_SUPABASE_ANON_KEY=your_supabase_anon_key
+```
+
+### 12. Device Endpoint Usage
+
+Devices should make GET requests to:
+```
+https://your-project.supabase.co/functions/v1/get-device-content?link_code=ABC123
+```
+
+Response format:
+```json
+{
+  "playlist": {
+    "id": "uuid",
+    "name": "Monday Specials",
+    "image_duration": 5
+  },
+  "content": [
+    {
+      "id": "uuid",
+      "filename": "image1.jpg",
+      "file_type": "image/jpeg",
+      "duration": null,
+      "url": "https://..."
+    },
+    {
+      "id": "uuid", 
+      "filename": "video1.mp4",
+      "file_type": "video/mp4",
+      "duration": 30,
+      "url": "https://..."
+    }
+  ]
+}
+```
+
+This setup provides a complete digital signage solution with user management, device linking, content management, and a modern dashboard interface.
